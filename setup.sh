@@ -1,7 +1,6 @@
 #!/bin/bash
-# File: setup-nocodb-secure-fixed.sh
-# Run as root (or with sudo) in your server
-# Fixes "Invalid URL" by setting NC_PUBLIC_URL and absolute NC_DB_URL
+# File: setup-nocodb-ipv6-fixed.sh
+# Run as root (or with sudo) – Fixes IPv6 URL parsing in NC_PUBLIC_URL for NocoDB Docker
 
 set -e  # Stop on any error
 
@@ -10,25 +9,47 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}Starting secure NocoDB setup with URL fixes...${NC}"
+echo -e "${GREEN}Starting NocoDB setup with IPv6 URL fix...${NC}"
 
 # 1. Create the folder if it doesn't exist
 echo "Creating /root/nocodb folder..."
 mkdir -p /root/nocodb
 cd /root/nocodb
 
-# 2. Detect public IP for NC_PUBLIC_URL
-PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || echo "localhost")
-if [ "$PUBLIC_IP" = "localhost" ]; then
-  echo -e "${RED}Warning: Could not detect public IP. Using 'localhost' – update NC_PUBLIC_URL manually later!${NC}"
+# 2. Detect public IP (prefer IPv4, fallback to IPv6 with brackets)
+echo "Detecting public IP..."
+PUBLIC_IP4=$(curl -s -4 ifconfig.me 2>/dev/null)
+if [ -n "$PUBLIC_IP4" ] && [[ ! "$PUBLIC_IP4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  PUBLIC_IP4=""  # Invalid if not IPv4 format
+fi
+
+if [ -n "$PUBLIC_IP4" ]; then
+  PUBLIC_IP="$PUBLIC_IP4"
+  echo "Using IPv4: $PUBLIC_IP"
+else
+  PUBLIC_IP6=$(curl -s -6 ifconfig.me 2>/dev/null)
+  if [[ "$PUBLIC_IP6" =~ ^[0-9a-fA-F:]+$ ]] && [ ${#PUBLIC_IP6} -gt 4 ]; then  # Basic IPv6 check
+    PUBLIC_IP="[${PUBLIC_IP6}]"  # Bracket for URL
+    echo "Using IPv6 (bracketed): $PUBLIC_IP"
+  else
+    PUBLIC_IP="localhost"
+    echo -e "${RED}Warning: Could not detect valid public IP. Using 'localhost' – update NC_PUBLIC_URL manually!${NC}"
+  fi
 fi
 PUBLIC_URL="http://${PUBLIC_IP}:8080"
 
-# 3. Generate a strong random JWT secret (64 characters, base64)
+# 3. Validate the URL with Node.js (quick test)
+echo "Validating URL: $PUBLIC_URL"
+node -e "try { new URL('$PUBLIC_URL'); console.log('URL valid!'); } catch(e) { console.error('URL invalid:', e.message); process.exit(1); }" || {
+  echo -e "${RED}URL validation failed. Edit .env manually and set NC_PUBLIC_URL to a valid format (e.g., http://[your-ipv6]:8080).${NC}"
+  exit 1
+}
+
+# 4. Generate a strong random JWT secret (64 characters, base64)
 echo "Generating strong JWT secret..."
 NC_AUTH_JWT_SECRET=$(openssl rand -base64 64 | tr '+/' '-_' | cut -c1-64)
 
-# 4. Write secure .env file
+# 5. Write secure .env file
 cat > .env << EOF
 # NocoDB Environment - Auto-generated on $(date)
 # =============================================
@@ -39,8 +60,8 @@ NC_AUTH_JWT_SECRET=${NC_AUTH_JWT_SECRET}
 NC_DB=sqlite
 NC_DB_URL=file:///usr/app/data/nocodb.sqlite
 
-# Public URL: Required for emails, API links, etc. Update to your domain/HTTPS later!
-# Format: http://your-ip:8080 or https://your-domain.com
+# Public URL: Fixed for IPv6 (bracketed) – Required for emails, API links, etc.
+# Update to your domain/HTTPS later! (e.g., https://your-domain.com)
 NC_PUBLIC_URL=${PUBLIC_URL}
 
 # Optional: Uncomment/add if using SMTP for emails
@@ -51,19 +72,19 @@ NC_PUBLIC_URL=${PUBLIC_URL}
 # NC_SMTP_PASS=your-app-password
 # NC_FROM_EMAIL=noreply@your-domain.com
 
-# Optional: For production, add more security
+# Optional: For production security
 # NC_DISABLE_SIGNUP=true  # Disable public signups
 EOF
 
-echo -e "${GREEN}Generated .env with fixes (NC_PUBLIC_URL: ${PUBLIC_URL}).${NC}"
+echo -e "${GREEN}Generated .env with IPv6 fix (NC_PUBLIC_URL: ${PUBLIC_URL}).${NC}"
 
-# 5. Create docker-compose.yml (loads .env automatically)
+# 6. Create docker-compose.yml (uses latest bug-fix image)
 cat > docker-compose.yml << 'EOF'
 version: "3.7"
 
 services:
   nocodb:
-    image: nocodb/nocodb:latest
+    image: nocodb/nocodb:0.263.1  # Latest bug-fix release (fixes URL issues)
     container_name: nocodb
     restart: unless-stopped
     ports:
@@ -86,38 +107,40 @@ volumes:
   data:
 EOF
 
-# 6. Secure .env (root-only read/write)
+# 7. Secure .env (root-only read/write)
 chmod 600 .env
 
-# 7. Clean start: Stop old container, remove old data if needed (comment out if you want to keep data)
+# 8. Clean start: Stop old, recreate data dir
 echo "Cleaning up old setup..."
-docker compose down -v  # -v removes volumes (uncomment if you want fresh start)
-mkdir -p data  # Recreate data dir
-chmod 777 data  # Allow Docker to write (fixes SQLite permission issues)
+docker compose down >/dev/null 2>&1 || true
+rm -rf data  # Fresh start (remove if you want to keep data)
+mkdir -p data
+chmod 777 data  # Docker write access
 
-# 8. Start NocoDB
+# 9. Start NocoDB
 echo "Starting NocoDB..."
 docker compose up -d
 
-# 9. Wait and check startup
-sleep 10
+# 10. Wait and verify startup
+sleep 15
 if docker ps | grep -q nocodb; then
-  LOGS=$(docker logs nocodb --tail 20)
-  if echo "$LOGS" | grep -q "NocoDB started on"; then
-    echo -e "${GREEN}Success! NocoDB is running.${NC}"
+  LOGS=$(docker logs nocodb --tail 30 2>/dev/null)
+  if echo "$LOGS" | grep -q "NocoDB started on"; && ! echo "$LOGS" | grep -q "Invalid URL"; then
+    echo -e "${GREEN}Success! NocoDB is running with IPv6 fix.${NC}"
     echo "URL: ${PUBLIC_URL}"
     echo "Dashboard: ${PUBLIC_URL}/dashboard"
     echo ""
-    echo "Check full logs: docker logs -f nocodb"
+    echo "Full logs: docker logs -f nocodb"
     echo ""
     echo -e "${GREEN}Next steps:${NC}"
-    echo "- Access http://${PUBLIC_IP}:8080 and complete setup."
-    echo "- For production: Add NGINX/SSL, update NC_PUBLIC_URL to https://your-domain.com"
+    echo "- Access ${PUBLIC_URL} and complete setup."
+    echo "- For production: Add NGINX/SSL, update NC_PUBLIC_URL to https://your-domain.com (avoids IPv6 issues)."
     echo "- Backup: rsync -a /root/nocodb/ /backup/"
-    echo "- If error persists: Run 'docker compose exec nocodb env | grep NC_' and share output."
+    echo "- Test IPv6 access: curl -6 '${PUBLIC_URL}'"
   else
-    echo -e "${RED}Startup failed. Recent logs:${NC}"
+    echo -e "${RED}Startup incomplete. Recent logs:${NC}"
     echo "$LOGS"
+    echo -e "${RED}If 'Invalid URL' persists, manually edit .env and restart: docker compose restart${NC}"
   fi
 else
   echo -e "${RED}Container failed to start. Check: docker logs nocodb${NC}"
